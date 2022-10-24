@@ -1,12 +1,17 @@
 use std::{env, fs};
 use std::fs::File;
 use std::io::prelude::*;
+use std::iter::zip;
 
 use nom::bytes::complete::{take, tag};
 use nom::multi::{count, many0};
 use nom::number::complete::{be_f64, be_u16, be_u32, be_u64, be_f32};
 use nom::combinator::map;
 use nom::{IResult, Finish};
+use nom::branch::alt;
+use nom::bits::bits;
+use nom::bits::streaming::take as bits_take;
+use bitvec::prelude::*;
 
 #[derive(Debug)]
 struct NUSD{
@@ -75,8 +80,6 @@ struct DATA{
   element: String,
   x_size: u32,
   y_size: u32,
-  packing: String,
-  missing: String,
   data: Vec<f32>,
 }
 
@@ -107,7 +110,7 @@ fn read_file(path: &str) -> Result<Vec<u8>,Box<dyn std::error::Error>>{
 
 
 pub fn load() -> Result<(),Box<dyn std::error::Error>>{
-  let input = read_file("202210121800")?;
+  let input = read_file("202210200900")?;
   let input: &[u8] = &input;
   let (input,nusd) = parse_nusd(input).unwrap();
   let (input, cntl) = parse_ctrl(input).unwrap();
@@ -115,7 +118,7 @@ pub fn load() -> Result<(),Box<dyn std::error::Error>>{
   let (input, subc) = parse_subc(input).unwrap();
   let (input, data) = many0(parse_data)(input).unwrap();
   let (input, end) = parse_end(input).unwrap();
-  println!("{:?}", end);
+  println!("{:?}", data.len());
   Ok(())
 }
 
@@ -259,15 +262,11 @@ fn parse_data(input: &[u8]) -> IResult<&[u8], DATA>{
   let (input, _) = take(2usize)(input)?;
   let (input, x_size) = be_u32(input)?;
   let (input, y_size) = be_u32(input)?;
-  let (input, packing) = take_string(4usize)(input)?;
-  let (input, missing) = take_string(4usize)(input)?;
-  let (input, base) = be_f32(input)?;
-  let (input, amp) = be_f32(input)?;
-  let (input, data) = count(
-    map(be_u16, |n| amp * (n as f32) + base ),
-    (x_size * y_size) as usize
-  )(input)?;
-  let gap_size = block_size - (48 + 8 + 2 * x_size *  y_size) as usize;
+  let (input, (data,packed_data_size)) = alt((
+    parse_2upc_data((x_size * y_size) as usize),
+    parse_2upp_data()
+  ))(input)?;
+  let gap_size = block_size - (48 + packed_data_size) as usize;
   let (input, _) = take(gap_size)(input)?;
   let (input, _) = take(4usize)(input)?;
 
@@ -280,10 +279,81 @@ fn parse_data(input: &[u8]) -> IResult<&[u8], DATA>{
     element,
     x_size,
     y_size,
-    packing,
-    missing,
     data,
   }))
+}
+
+fn parse_2upc_data(data_size: usize) -> impl FnMut(&[u8]) -> IResult<&[u8],(Vec<f32>, usize)>{
+  move |input: &[u8]|{
+    let (input, _) = tag("2UPC")(input)?;
+    let (input, missing) = take_string(4usize)(input)?;
+    let (input, base) = be_f32(input)?;
+    let (input, amp) = be_f32(input)?;
+    let (input, data) = count(
+      map(be_u16, |n| amp * (n as f32) + base ),
+      data_size
+    )(input)?;
+    Ok((input, (data, 8 + 2 * data_size)))
+  }
+}
+
+fn parse_2upp_data() ->  impl FnMut(&[u8]) -> IResult<&[u8],(Vec<f32>, usize)>{
+  move |input: &[u8]|{
+    let (input, _) = tag("2UPP")(input)?;
+    let (input, missing) = take_string(4usize)(input)?;
+    let (input, base) = be_f32(input)?;
+    let (input, amp) = be_f32(input)?;
+    let (input, n) = be_u32(input)?;
+    let n_g = ((n - 1) / 32 + 1) as usize;
+    let n_h = (n_g - 1) / 2 + 1; 
+    let n_last = (n % 32) as usize;
+    let (input, r) = count(be_u16, n_g)(input)?; 
+    let (input, w) :(&[u8],Vec<u8>) = 
+      bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(
+        count(bits_take(4usize),n_g)
+      )(input)?;
+    
+    let mut data: Vec<f32> = Vec::new();
+    let mut input = input;
+    let mut buf;
+    for i in 0..(n_g - 1){
+      (input, buf) = take::<_,_,nom::error::Error<_>>((4 * (w[i] + 1)) as usize)(input).unwrap();
+      let bits = buf.view_bits::<Msb0>();
+      let p = bits.chunks((w[i] + 1) as usize).map(|c|{
+        c.load_be::<u32>() + r[i] as u32
+      }).collect::<Vec<_>>();
+      let mut u: [u32; 32] = [0;32];
+      u[0] = (p[0] + 32768) % 65536;
+      u[1] = (p[1] as u32 + 32768) % 65536;
+      p[2..].iter().enumerate().for_each(|(j,p)|{ 
+        u[j + 2] = (p + u[j + 1] * 2  + 32768 + 65536 - u[j]) % 65536;
+      });
+      let mut d = u.into_iter().map(|u| amp * (u as f32) + base).collect::<Vec<_>>();
+      data.append(&mut d);
+    };
+
+    let last_w = (w[n_g - 1] + 1) as usize;
+    let last_bytes = (last_w * n_last) / 8 + 1;
+    let (input, buf) = take::<_,_,nom::error::Error<_>>(last_bytes)(input).unwrap();
+    let bits = buf.view_bits::<Msb0>();
+    let p = bits.chunks(last_w).map(|c|{
+      c.load_be::<u32>() + r[n_g - 1] as u32
+    }).collect::<Vec<_>>();
+    let p = &p[..n_last];
+    let mut u:Vec<u32> = Vec::new();
+    u.push((p[0] + 32768) % 65536);
+    if p.len() > 1 {
+      u.push((p[1] as u32 + 32768) % 65536);
+      p[2..].iter().enumerate().for_each(|(j,p)|{ 
+        u.push((p + u[j + 1] * 2  + 32768 + 65536 - u[j]) % 65536);
+      });
+    }
+    let mut d = u.into_iter().map(|u| amp * (u as f32) + base).collect::<Vec<_>>();
+    data.append(&mut d);
+
+    let w_size: usize = &w[..n_g -1].iter().map(|w| 4 * (*w as usize + 1)).sum() + last_bytes;
+    Ok((input,(data,12 + 2 * n_g + n_h + w_size)))
+  }
 }
 
 fn parse_end(input: &[u8]) -> IResult<&[u8], END>{
