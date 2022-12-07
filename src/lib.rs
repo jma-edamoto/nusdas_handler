@@ -1,17 +1,19 @@
 use std::{env, fs};
 use std::fs::File;
 use std::io::prelude::*;
+use nom_bufreader::bufreader::BufReader;
 use std::iter::zip;
 
 use nom::bytes::complete::{take, tag};
 use nom::multi::{count, many0};
-use nom::number::complete::{be_f64, be_u16, be_u32, be_u64, be_f32};
+use nom::number::complete::{be_f64, be_u16, be_u32, be_u64, be_f32, be_i64};
 use nom::combinator::map;
 use nom::{IResult, Finish};
 use nom::branch::alt;
 use nom::bits::bits;
 use nom::bits::streaming::take as bits_take;
 use bitvec::prelude::*;
+use itertools::{Itertools, iproduct, multizip};
 
 #[derive(Debug)]
 struct NUSD{
@@ -56,16 +58,25 @@ struct CNTL{
 }
 
 impl CNTL{
-  fn data_size(&self) -> usize{
-    self.members.len() * self.forecast_times_1.len()* self.planes_1.len() * self.elements.len()
+  fn index(&self) -> Vec<(String,u32,String,String)>{
+    iproduct!(
+      self.members.iter(),
+      self.forecast_times_1.iter(),
+      self.planes_1.iter(),
+      self.elements.iter()
+    ).map(|(m,f,p,e)|(m.to_string(), *f,p.to_string(),e.to_string())).collect_vec()
   }
 }
 
-#[derive(Debug)]
-struct INDY{
-  record_position: Vec<u64>,
-  record_length: Vec<u32>,
-  record_size: Vec<u32>,
+#[derive(Debug,Clone)]
+struct INDY {
+  member: String,
+  forecast_time: u32,
+  plane: String,
+  element: String,
+  record_position: i64,
+  record_length: u32,
+  record_size: u32,
 }
 
 struct SUBC{}
@@ -92,15 +103,6 @@ struct END{
   record_size: u32,
 }
 
-struct NusdasData {
-  nusd: NUSD,
-  cntl: CNTL,
-  indy: INDY,
-  subc: Vec<SUBC>,
-  data: Vec<DATA>,
-  info: Vec<INFO>
-}
-
 fn read_file(path: &str) -> Result<Vec<u8>,Box<dyn std::error::Error>>{
   let mut file = File::open(path)?;
   let mut buf: Vec<u8> = Vec::new();
@@ -108,18 +110,41 @@ fn read_file(path: &str) -> Result<Vec<u8>,Box<dyn std::error::Error>>{
   Ok(buf)
 }
 
+fn decode(input: &[u8]) -> IResult<&[u8], ()>{
+  let (input,(nusd,cntl,indy)) = decode_index(input)?;
 
-pub fn load() -> Result<(),Box<dyn std::error::Error>>{
-  let input = read_file("202210200900")?;
-  let input: &[u8] = &input;
-  let (input,nusd) = parse_nusd(input).unwrap();
-  let (input, cntl) = parse_ctrl(input).unwrap();
-  let (input, indy) = parse_indy(input, cntl.data_size()).unwrap();
-  let (input, subc) = parse_subc(input).unwrap();
-  let (input, data) = many0(parse_data)(input).unwrap();
-  let (input, end) = parse_end(input).unwrap();
-  println!("{:?}", data.len());
-  Ok(())
+  let (input, subc) = parse_subc(input)?;
+  let (input, data) = many0(parse_data)(input)?;
+  let (input, end) = parse_end(input)?;
+  println!("{:?}", indy);
+  Ok((input,()))
+}
+
+fn decode_index(input: &[u8]) -> IResult<&[u8], (NUSD,CNTL,Vec<INDY>)>{
+  let (input,(nusd,nusd_size)) = parse_nusd(input)?;
+  let (input, cntl) = parse_cntl(input)?;
+  let (input, indy) = parse_indy(input, &cntl)?;
+  let indy = indy.iter()
+    .filter(|i| i.record_position > 0)
+    .sorted_by(|i,j| Ord::cmp(&i.record_position, &j.record_position) )
+    .cloned()
+    .collect::<Vec<INDY>>();
+  Ok((input,(nusd,cntl,indy)))
+}
+
+fn decode_spsecific_index(
+  input: &[u8],
+  forecast_time: u32,
+  element:String,
+  plane:String
+) -> IResult<&[u8], (NUSD,CNTL,Vec<INDY>)>{
+  let (input,(nusd,cntl,index)) = decode_index(input)?;
+  let index = index.iter()
+    .filter(|i| i.forecast_time == forecast_time && i.element == element && i.plane == plane)
+    .cloned()
+    .collect::<Vec<INDY>>();
+
+  Ok((input,(nusd,cntl,index)))
 }
 
 fn parse_header<'a>(header: &'a str) -> impl for <'b> Fn(&'b [u8])-> IResult<&'b [u8], usize> + 'a{
@@ -128,7 +153,7 @@ fn parse_header<'a>(header: &'a str) -> impl for <'b> Fn(&'b [u8])-> IResult<&'b
     let (input, _) = tag(header)(input)?;
     let (input,_) = be_u32(input)?;
     let (input,_) = take(4usize)(input)?;
-    Ok((input, (record_size - 12) as usize))
+    Ok((input, (record_size as usize) + 4))
   }
 }
 
@@ -140,7 +165,7 @@ fn take_string(count: usize) -> impl for <'a> Fn(&'a [u8])-> IResult<&'a [u8], S
   }
 }
 
-fn parse_nusd(input: &[u8]) -> IResult<&[u8], NUSD>{
+fn parse_nusd(input: &[u8]) -> IResult<&[u8], (NUSD, usize)>{
   let (input, block_size) = parse_header("NUSD")(input)?;
   let (input,creator) = take_string(72usize)(input)?;
   let (input, file_size) = be_u64(input)?;
@@ -149,19 +174,19 @@ fn parse_nusd(input: &[u8]) -> IResult<&[u8], NUSD>{
   let (input, record_size) = be_u32(input)?;
   let (input, info_record_size) = be_u32(input)?;
   let (input, subc_record_size) = be_u32(input)?;
-  let (input, _) = take(block_size - 100usize)(input)?;
+  let (input, _) = take(block_size - 116usize)(input)?;
   let (input, _) = take(4usize)(input)?;
-  Ok((input, NUSD{
+  Ok((input, (NUSD{
     creator,
     file_size,
     file_version,
     record_size,
     info_record_size,
     subc_record_size,
-  }))
+  },block_size + 4)))
 }
 
-fn parse_ctrl(input: &[u8]) -> IResult<&[u8], CNTL>{
+fn parse_cntl(input: &[u8]) -> IResult<&[u8], CNTL>{
   let (input, block_size) = parse_header("CNTL")(input)?;
   let (input, difinition_type) = take_string(16usize)(input)?;
   let (input, base_time_str) = take_string(12usize)(input)?;
@@ -196,8 +221,7 @@ fn parse_ctrl(input: &[u8]) -> IResult<&[u8], CNTL>{
   let (input, planes_1) = count(take_string(6usize),  plane_size as usize)(input)?;
   let (input, planes_2) = count(take_string(6usize),  plane_size as usize)(input)?;
   let (input, elements) = count(take_string(6usize),  element_size as usize)(input)?;
-  let gap_size 
-    = block_size - (156 + 4 * member_size + 4 * forecast_time_size * 2 + 6 * plane_size * 2 + 6 * element_size) as usize;
+  let gap_size = block_size - (172 + 4 * member_size + 4 * forecast_time_size * 2 + 6 * plane_size * 2 + 6 * element_size) as usize;
   let (input, _) = take(gap_size)(input)?;
   let (input, _) = take(4usize)(input)?;
   Ok((input, CNTL{
@@ -232,19 +256,31 @@ fn parse_ctrl(input: &[u8]) -> IResult<&[u8], CNTL>{
   }))
 }
 
-fn parse_indy(input: &[u8], data_size: usize) -> IResult<&[u8], INDY>{
+fn parse_indy<'a>(input: &'a [u8], cntl: &CNTL) -> IResult<&'a [u8], Vec<INDY>>{
+  let index = cntl.index();
+  let data_size = index.len();
   let (input, block_size) = parse_header("INDY")(input)?;
-  let (input, record_position) = count(be_u64, data_size)(input)?;
+  let (input, record_position) = count(be_i64, data_size)(input)?;
   let (input, record_length) = count(be_u32, data_size)(input)?;
   let (input, record_size) = count(be_u32, data_size)(input)?;
-  let gap_size = block_size - (8 * data_size + 4 * data_size + 4 * data_size)  as usize;
+  let gap_size = block_size - (16 + 8 * data_size + 4 * data_size + 4 * data_size)  as usize;
   let (input, _) = take(gap_size)(input)?;
   let (input, _) = take(4usize)(input)?;
-  Ok((input,INDY{
-    record_position,
-    record_length,
-    record_size,
-  }))
+  let index = multizip((index,record_position,record_length,record_size))
+    .map(|((member,forecast_time,plane,element),record_position,record_length,record_size)|{
+      INDY{
+        member,
+        forecast_time,
+        plane,
+        element,
+        record_position,
+        record_length,
+        record_size
+      }
+    }).collect_vec();
+
+
+  Ok((input,index))
 }
 
 fn parse_subc(input: &[u8]) -> IResult<&[u8], SUBC>{
@@ -266,7 +302,7 @@ fn parse_data(input: &[u8]) -> IResult<&[u8], DATA>{
     parse_2upc_data((x_size * y_size) as usize),
     parse_2upp_data()
   ))(input)?;
-  let gap_size = block_size - (48 + packed_data_size) as usize;
+  let gap_size = block_size - (64 + packed_data_size) as usize;
   let (input, _) = take(gap_size)(input)?;
   let (input, _) = take(4usize)(input)?;
 
@@ -360,7 +396,7 @@ fn parse_end(input: &[u8]) -> IResult<&[u8], END>{
   let (input, block_size) = parse_header("END ")(input)?;
   let (input, file_size) = be_u32(input)?;
   let (input, record_size) = be_u32(input)?;
-  let (input, _) = take(block_size - 8usize)(input)?;
+  let (input, _) = take(block_size - 24usize)(input)?;
   let (input, _ ) = take(4usize)(input)?;
   Ok((input, END{
     file_size,
@@ -370,10 +406,13 @@ fn parse_end(input: &[u8]) -> IResult<&[u8], END>{
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
     use super::*;
 
     #[test]
-    fn it_works() {
-        load();
+    fn it_works() -> Result<(), Box<dyn Error>>{
+      let input = read_file("202210200900")?;
+      decode(&input).map_err(|err| anyhow::format_err!("{:?}",err))?;
+      Ok(())
     }
 }
