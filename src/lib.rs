@@ -1,14 +1,15 @@
-use std::{env, fs};
+use std::error::Error;
 use std::fs::File;
 use std::io::prelude::*;
-use nom_bufreader::bufreader::BufReader;
-use std::iter::zip;
+use std::io::BufReader;
+
+use byteorder::{BigEndian, ByteOrder};
 
 use nom::bytes::complete::{take, tag};
-use nom::multi::{count, many0};
-use nom::number::complete::{be_f64, be_u16, be_u32, be_u64, be_f32, be_i64};
+use nom::multi::{count};
+use nom::number::complete::{be_u16, be_u32, be_u64, be_f32, be_i64};
 use nom::combinator::map;
-use nom::{IResult, Finish};
+use nom::IResult;
 use nom::branch::alt;
 use nom::bits::bits;
 use nom::bits::streaming::take as bits_take;
@@ -103,58 +104,91 @@ struct END{
   record_size: u32,
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>,Box<dyn std::error::Error>>{
-  let mut file = File::open(path)?;
-  let mut buf: Vec<u8> = Vec::new();
-  file.read_to_end(&mut buf)?;
+fn read_to_buffer(input: &mut BufReader<File>, n: usize) -> Result<Box<[u8]>, Box<dyn Error>>{
+  let mut buf = vec![0u8;n].into_boxed_slice();
+  input.read_exact(&mut buf)?;
   Ok(buf)
 }
 
-fn decode(input: &[u8]) -> IResult<&[u8], ()>{
-  let (input,(nusd,cntl,indy)) = decode_index(input)?;
-
-  let (input, subc) = parse_subc(input)?;
-  let (input, data) = many0(parse_data)(input)?;
-  let (input, end) = parse_end(input)?;
-  println!("{:?}", indy);
-  Ok((input,()))
+fn apply_parser<T, P>(record: &[u8], parser:&mut P) -> Result<T, Box<dyn Error>>
+where 
+  P: FnMut(&[u8]) -> IResult<&[u8], T>,
+{
+  let (_,data) = parser(&record).map_err(|err| anyhow::format_err!("{:?}",err))?;
+  Ok(data)
 }
 
-fn decode_index(input: &[u8]) -> IResult<&[u8], (NUSD,CNTL,Vec<INDY>)>{
-  let (input,(nusd,nusd_size)) = parse_nusd(input)?;
-  let (input, cntl) = parse_cntl(input)?;
-  let (input, indy) = parse_indy(input, &cntl)?;
+fn apply_parser_with_arg<T, P, A>(record: &[u8], parser:P, arg: A) -> Result<T, Box<dyn Error>>
+where P: Fn(&[u8], A) -> IResult<&[u8], T>{
+  let (_,data) = parser(&record, arg).map_err(|err| anyhow::format_err!("{:?}",err))?;
+  Ok(data)
+}
+
+fn read_record_header(input: &mut BufReader<File>) -> Result<(usize, String, Box<[u8]>), Box<dyn Error>>{
+  let mut buf = [0u8;4];
+  input.read(&mut buf)?;
+  let record_size = BigEndian::read_u32(&buf) as usize;
+  input.read(&mut buf)?;
+  let record_name = (std::str::from_utf8(&buf)?).to_string();
+  input.consume(8);
+  let record = read_to_buffer(input, record_size - 8)?;
+  Ok((record_size, record_name, record))
+}
+
+fn read_index(input: &mut BufReader<File>) -> Result<(NUSD, CNTL, Vec<INDY>, usize), Box<dyn Error>>{
+  //nusd
+  let (nusd_size, record_name, record) = read_record_header(input)?;
+  if record_name != "NUSD" { panic!("File does not follow NUSDAS format");}
+  let nusd = apply_parser(&*record, &mut parse_nusd)?;
+
+  //cntl
+  let (cntl_size, record_name, record) = read_record_header(input)?;
+  if record_name != "CNTL" { panic!("File does not follow NUSDAS format");}
+  let cntl = apply_parser(&*record, &mut parse_cntl)?;
+
+  //indy
+  let (indy_size, record_name, record) = read_record_header(input)?;
+  if record_name != "INDY" { panic!("File does not follow NUSDAS format");}
+  let indy = apply_parser_with_arg(&*record, parse_indy, &cntl)?;
+
+  let record_position = nusd_size + cntl_size + indy_size + 24;
+  Ok((nusd, cntl, indy, record_position))
+}
+
+fn read_end_block(input: &mut BufReader<File>) -> Result<(), Box<dyn Error>>{
+  let (_, record_name, record) = read_record_header(input)?;
+  if record_name != "END" { panic!("File does not follow NUSDAS format");}
+  apply_parser(&*record, &mut parse_end)?;
+  Ok(())
+}
+
+pub fn decode(path: &str) -> Result<(), Box<dyn Error>>{
+  let mut input = BufReader::new(File::open(path)?);
+  let (nusd, cntl, indy, mut record_position) = read_index(&mut input)?;
+
   let indy = indy.iter()
     .filter(|i| i.record_position > 0)
     .sorted_by(|i,j| Ord::cmp(&i.record_position, &j.record_position) )
     .cloned()
     .collect::<Vec<INDY>>();
-  Ok((input,(nusd,cntl,indy)))
-}
-
-fn decode_spsecific_index(
-  input: &[u8],
-  forecast_time: u32,
-  element:String,
-  plane:String
-) -> IResult<&[u8], (NUSD,CNTL,Vec<INDY>)>{
-  let (input,(nusd,cntl,index)) = decode_index(input)?;
-  let index = index.iter()
-    .filter(|i| i.forecast_time == forecast_time && i.element == element && i.plane == plane)
+  let element = "PSEA";
+  let plane = "SURF";
+  let indy = indy.iter()
+    .filter(|i| i.plane == plane && i.element == element)
     .cloned()
     .collect::<Vec<INDY>>();
 
-  Ok((input,(nusd,cntl,index)))
-}
-
-fn parse_header<'a>(header: &'a str) -> impl for <'b> Fn(&'b [u8])-> IResult<&'b [u8], usize> + 'a{
-  move |input: &[u8]|{
-    let (input, record_size) = be_u32(input)?;
-    let (input, _) = tag(header)(input)?;
-    let (input,_) = be_u32(input)?;
-    let (input,_) = take(4usize)(input)?;
-    Ok((input, (record_size as usize) + 4))
+  let mut subc: Vec<SUBC> = Vec::new();
+  let mut data: Vec<DATA> = Vec::new(); 
+  let mut info: Vec<INFO> = Vec::new();
+  for i in indy {
+    read_to_buffer(&mut input, (i.record_position as usize) - record_position)?;
+    let (_, record_name, record) = read_record_header(&mut input)?;
+    if record_name != "DATA" { panic!("File does not follow NUSDAS format");}
+    data.push(apply_parser(&*record, &mut parse_data)?);
+    record_position = (i.record_position as usize) + (i.record_length as usize);
   }
+  Ok(())
 }
 
 fn take_string(count: usize) -> impl for <'a> Fn(&'a [u8])-> IResult<&'a [u8], String>{
@@ -165,8 +199,7 @@ fn take_string(count: usize) -> impl for <'a> Fn(&'a [u8])-> IResult<&'a [u8], S
   }
 }
 
-fn parse_nusd(input: &[u8]) -> IResult<&[u8], (NUSD, usize)>{
-  let (input, block_size) = parse_header("NUSD")(input)?;
+fn parse_nusd(input: &[u8]) -> IResult<&[u8], NUSD>{
   let (input,creator) = take_string(72usize)(input)?;
   let (input, file_size) = be_u64(input)?;
   let (input, file_version) = be_u32(input)?;
@@ -174,20 +207,17 @@ fn parse_nusd(input: &[u8]) -> IResult<&[u8], (NUSD, usize)>{
   let (input, record_size) = be_u32(input)?;
   let (input, info_record_size) = be_u32(input)?;
   let (input, subc_record_size) = be_u32(input)?;
-  let (input, _) = take(block_size - 116usize)(input)?;
-  let (input, _) = take(4usize)(input)?;
-  Ok((input, (NUSD{
+  Ok((input, NUSD{
     creator,
     file_size,
     file_version,
     record_size,
     info_record_size,
     subc_record_size,
-  },block_size + 4)))
+  }))
 }
 
 fn parse_cntl(input: &[u8]) -> IResult<&[u8], CNTL>{
-  let (input, block_size) = parse_header("CNTL")(input)?;
   let (input, difinition_type) = take_string(16usize)(input)?;
   let (input, base_time_str) = take_string(12usize)(input)?;
   let (input, base_time) = be_u32(input)?;
@@ -221,9 +251,6 @@ fn parse_cntl(input: &[u8]) -> IResult<&[u8], CNTL>{
   let (input, planes_1) = count(take_string(6usize),  plane_size as usize)(input)?;
   let (input, planes_2) = count(take_string(6usize),  plane_size as usize)(input)?;
   let (input, elements) = count(take_string(6usize),  element_size as usize)(input)?;
-  let gap_size = block_size - (172 + 4 * member_size + 4 * forecast_time_size * 2 + 6 * plane_size * 2 + 6 * element_size) as usize;
-  let (input, _) = take(gap_size)(input)?;
-  let (input, _) = take(4usize)(input)?;
   Ok((input, CNTL{
     difinition_type,
     base_time_str,
@@ -259,14 +286,10 @@ fn parse_cntl(input: &[u8]) -> IResult<&[u8], CNTL>{
 fn parse_indy<'a>(input: &'a [u8], cntl: &CNTL) -> IResult<&'a [u8], Vec<INDY>>{
   let index = cntl.index();
   let data_size = index.len();
-  let (input, block_size) = parse_header("INDY")(input)?;
   let (input, record_position) = count(be_i64, data_size)(input)?;
   let (input, record_length) = count(be_u32, data_size)(input)?;
   let (input, record_size) = count(be_u32, data_size)(input)?;
-  let gap_size = block_size - (16 + 8 * data_size + 4 * data_size + 4 * data_size)  as usize;
-  let (input, _) = take(gap_size)(input)?;
-  let (input, _) = take(4usize)(input)?;
-  let index = multizip((index,record_position,record_length,record_size))
+  let indy = multizip((index,record_position,record_length,record_size))
     .map(|((member,forecast_time,plane,element),record_position,record_length,record_size)|{
       INDY{
         member,
@@ -278,9 +301,7 @@ fn parse_indy<'a>(input: &'a [u8], cntl: &CNTL) -> IResult<&'a [u8], Vec<INDY>>{
         record_size
       }
     }).collect_vec();
-
-
-  Ok((input,index))
+  Ok((input,indy))
 }
 
 fn parse_subc(input: &[u8]) -> IResult<&[u8], SUBC>{
@@ -288,7 +309,6 @@ fn parse_subc(input: &[u8]) -> IResult<&[u8], SUBC>{
 }
 
 fn parse_data(input: &[u8]) -> IResult<&[u8], DATA>{
-  let (input, block_size) = parse_header("DATA")(input)?;
   let (input, member) = take_string(4usize)(input)?;
   let (input, time_1) =be_u32(input)?;
   let (input, time_2) =be_u32(input)?;
@@ -298,14 +318,10 @@ fn parse_data(input: &[u8]) -> IResult<&[u8], DATA>{
   let (input, _) = take(2usize)(input)?;
   let (input, x_size) = be_u32(input)?;
   let (input, y_size) = be_u32(input)?;
-  let (input, (data,packed_data_size)) = alt((
+  let (input, (data,_)) = alt((
     parse_2upc_data((x_size * y_size) as usize),
     parse_2upp_data()
   ))(input)?;
-  let gap_size = block_size - (64 + packed_data_size) as usize;
-  let (input, _) = take(gap_size)(input)?;
-  let (input, _) = take(4usize)(input)?;
-
   Ok((input, DATA{
     member,
     time_1,
@@ -341,28 +357,31 @@ fn parse_2upp_data() ->  impl FnMut(&[u8]) -> IResult<&[u8],(Vec<f32>, usize)>{
     let (input, amp) = be_f32(input)?;
     let (input, n) = be_u32(input)?;
     let n_g = ((n - 1) / 32 + 1) as usize;
-    let n_h = (n_g - 1) / 2 + 1; 
+    let n_h = (n_g - 1) / 2 + 1;
     let n_last = (n % 32) as usize;
-    let (input, r) = count(be_u16, n_g)(input)?; 
+    let (input, r) = count(be_u16, n_g)(input)?;
     let (input, w) :(&[u8],Vec<u8>) = 
       bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(
         count(bits_take(4usize),n_g)
       )(input)?;
-    
     let mut data: Vec<f32> = Vec::new();
     let mut input = input;
     let mut buf;
     for i in 0..(n_g - 1){
       (input, buf) = take::<_,_,nom::error::Error<_>>((4 * (w[i] + 1)) as usize)(input).unwrap();
       let bits = buf.view_bits::<Msb0>();
+
       let p = bits.chunks((w[i] + 1) as usize).map(|c|{
         c.load_be::<u32>() + r[i] as u32
       }).collect::<Vec<_>>();
+      if(i == 0){
+        println!("{:?}",p);
+      }
       let mut u: [u32; 32] = [0;32];
-      u[0] = (p[0] + 32768) % 65536;
-      u[1] = (p[1] as u32 + 32768) % 65536;
+      u[0] = (p[0] - 32768) % 65536;
+      u[1] = (p[1] as u32 - 32768) % 65536;
       p[2..].iter().enumerate().for_each(|(j,p)|{ 
-        u[j + 2] = (p + u[j + 1] * 2  + 32768 + 65536 - u[j]) % 65536;
+        u[j + 2] = (p + u[j + 1] * 2 + 65536 - 32768  - u[j]) % 65536;
       });
       let mut d = u.into_iter().map(|u| amp * (u as f32) + base).collect::<Vec<_>>();
       data.append(&mut d);
@@ -393,11 +412,8 @@ fn parse_2upp_data() ->  impl FnMut(&[u8]) -> IResult<&[u8],(Vec<f32>, usize)>{
 }
 
 fn parse_end(input: &[u8]) -> IResult<&[u8], END>{
-  let (input, block_size) = parse_header("END ")(input)?;
   let (input, file_size) = be_u32(input)?;
   let (input, record_size) = be_u32(input)?;
-  let (input, _) = take(block_size - 24usize)(input)?;
-  let (input, _ ) = take(4usize)(input)?;
   Ok((input, END{
     file_size,
     record_size,
@@ -411,8 +427,7 @@ mod tests {
 
     #[test]
     fn it_works() -> Result<(), Box<dyn Error>>{
-      let input = read_file("202210200900")?;
-      decode(&input).map_err(|err| anyhow::format_err!("{:?}",err))?;
+      decode("202210200900")?;
       Ok(())
     }
 }
