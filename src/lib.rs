@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
+use nom::Finish;
+use serde::{Serialize, Deserialize};
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -15,6 +17,16 @@ use nom::bits::bits;
 use nom::bits::streaming::take as bits_take;
 use bitvec::prelude::*;
 use itertools::{Itertools, iproduct, multizip};
+use serde_json;
+use thiserror;
+
+#[derive(thiserror::Error, Debug)]
+pub enum NusdasError{
+  #[error("nom parsing error")]
+  Parse,
+  #[error(transparent)]
+  Io(#[from] std::io::Error)
+}
 
 #[derive(Debug)]
 struct NUSD{
@@ -82,8 +94,8 @@ struct INDY {
 
 struct SUBC{}
 
-#[derive(Debug)]
-struct DATA{
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DATA{
   member: String,
   time_1: u32,
   time_2: u32,
@@ -116,6 +128,16 @@ where
 {
   let (_,data) = parser(&record).map_err(|err| anyhow::format_err!("{:?}",err))?;
   Ok(data)
+}
+
+fn apply_parser_new<T, P>(record: &[u8], parser:&mut P) -> Result<T, NusdasError>
+where 
+  P: FnMut(&[u8]) -> IResult<&[u8], T>,
+{
+  match parser(record).finish(){
+    Ok((_,data)) => return Ok(data),
+    Err(_) => return Err(NusdasError::Parse),
+  }
 }
 
 fn apply_parser_with_arg<T, P, A>(record: &[u8], parser:P, arg: A) -> Result<T, Box<dyn Error>>
@@ -162,7 +184,7 @@ fn read_end_block(input: &mut BufReader<File>) -> Result<(), Box<dyn Error>>{
   Ok(())
 }
 
-pub fn decode(path: &str) -> Result<(), Box<dyn Error>>{
+pub fn decode(path: &str) -> Result<Vec<DATA>, Box<dyn Error>>{
   let mut input = BufReader::new(File::open(path)?);
   let (nusd, cntl, indy, mut record_position) = read_index(&mut input)?;
 
@@ -188,7 +210,13 @@ pub fn decode(path: &str) -> Result<(), Box<dyn Error>>{
     data.push(apply_parser(&*record, &mut parse_data)?);
     record_position = (i.record_position as usize) + (i.record_length as usize);
   }
-  Ok(())
+  Ok(data)
+}
+
+pub fn decode_to_json(path: &str) -> Result<String, Box<dyn Error>>{
+  let data = decode(path)?;
+  let j = serde_json::to_string(&data)?;
+  Ok(j)
 }
 
 fn take_string(count: usize) -> impl for <'a> Fn(&'a [u8])-> IResult<&'a [u8], String>{
@@ -374,9 +402,6 @@ fn parse_2upp_data() ->  impl FnMut(&[u8]) -> IResult<&[u8],(Vec<f32>, usize)>{
       let p = bits.chunks((w[i] + 1) as usize).map(|c|{
         c.load_be::<u32>() + r[i] as u32
       }).collect::<Vec<_>>();
-      if(i == 0){
-        println!("{:?}",p);
-      }
       let mut u: [u32; 32] = [0;32];
       u[0] = (p[0] - 32768) % 65536;
       u[1] = (p[1] as u32 - 32768) % 65536;
